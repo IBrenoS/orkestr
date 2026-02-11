@@ -1,0 +1,173 @@
+// Orkestr — Prisma Schema
+// Entidades do Execution Engine: Event, Workflow, Run, StepRun
+// Conforme definido em 07-execution-engine-spec.md
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Identity & Tenant ───────────────────────────────────────
+
+model Tenant {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  workflows Workflow[]
+  events    Event[]
+
+  @@map("tenants")
+}
+
+// ─── Event Ingestion ─────────────────────────────────────────
+
+model Event {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @map("tenant_id") @db.Uuid
+  type       String   // e.g. "invoice_overdue", "lead_created"
+  payload    Json     @default("{}")
+  source     String   @default("api") // api, webhook, internal
+  externalId String?  @map("external_id") // caller-provided dedup key
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  runs   Run[]
+
+  @@unique([tenantId, source, externalId]) // idempotency constraint
+  @@index([tenantId, type])
+  @@index([createdAt])
+  @@map("events")
+}
+
+// ─── Workflow Definition ─────────────────────────────────────
+
+model Workflow {
+  id          String    @id @default(uuid()) @db.Uuid
+  tenantId    String    @map("tenant_id") @db.Uuid
+  name        String
+  description String?
+  triggerType String    @map("trigger_type") // event type that triggers this workflow
+  version     Int       @default(1)
+  isActive    Boolean   @default(true) @map("is_active")
+  publishedAt DateTime? @map("published_at") // once published, steps are immutable
+  steps       Json      @default("[]") // Array of step definitions (condition, action, ai_task, delay, end)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  runs   Run[]
+
+  @@unique([tenantId, name, version])
+  @@index([tenantId, triggerType])
+  @@map("workflows")
+}
+
+// ─── Execution: Run ──────────────────────────────────────────
+
+enum RunStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+
+  @@map("run_status")
+}
+
+model Run {
+  id         String    @id @default(uuid()) @db.Uuid
+  workflowId String    @map("workflow_id") @db.Uuid
+  eventId    String    @map("event_id") @db.Uuid
+  status     RunStatus @default(PENDING)
+  context    Json      @default("{}") // runtime context / accumulated data
+  startedAt  DateTime? @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+  error      String?
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  workflow Workflow  @relation(fields: [workflowId], references: [id])
+  event    Event     @relation(fields: [eventId], references: [id])
+  stepRuns StepRun[]
+  runLogs  RunLog[]
+
+  @@index([workflowId, status])
+  @@index([eventId])
+  @@index([createdAt])
+  @@map("runs")
+}
+
+// ─── Execution: Step Run ─────────────────────────────────────
+
+enum StepRunStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  SKIPPED
+  RETRYING
+
+  @@map("step_run_status")
+}
+
+model StepRun {
+  id           String        @id @default(uuid()) @db.Uuid
+  runId        String        @map("run_id") @db.Uuid
+  stepKey      String        @map("step_key") // reference to step in workflow.steps
+  stepType     String        @map("step_type") // condition, action, ai_task, delay, end
+  status       StepRunStatus @default(PENDING)
+  input        Json          @default("{}")
+  output       Json          @default("{}")
+  error        String?
+  providerRef  String?       @map("provider_ref") // action idempotency — tracks external ref
+  attempt      Int           @default(1)
+  startedAt    DateTime?     @map("started_at")
+  finishedAt   DateTime?     @map("finished_at")
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+
+  run Run @relation(fields: [runId], references: [id])
+
+  @@index([runId, stepKey])
+  @@index([status])
+  @@map("step_runs")
+}
+
+// ─── Run Log (operational per-run logs) ─────────────────────
+
+model RunLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  runId     String   @map("run_id") @db.Uuid
+  level     String   @default("info") // info, warn, error
+  message   String
+  context   Json     @default("{}") // stepKey, extra data
+  createdAt DateTime @default(now()) @map("created_at")
+
+  run Run @relation(fields: [runId], references: [id])
+
+  @@index([runId])
+  @@index([createdAt])
+  @@map("run_logs")
+}
+
+// ─── Audit Log ───────────────────────────────────────────────
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  entity    String   // "event", "run", "step_run", etc.
+  entityId  String   @map("entity_id") @db.Uuid
+  action    String   // "created", "status_changed", "failed", etc.
+  details   Json     @default("{}")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([entity, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
