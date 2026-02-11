@@ -30,7 +30,7 @@ export class StepRunner {
   constructor(
     private readonly prisma: PrismaClient,
     private readonly queue: Queue,
-  ) {}
+  ) { }
 
   // ─── Main entry point ──────────────────────────────────────
 
@@ -66,15 +66,15 @@ export class StepRunner {
     }
 
     // 3. Idempotency: action already executed?
-    if (stepRun.stepType === 'action' && stepRun.providerRef) {
+    if (stepRun.stepType === 'action' && stepRun.intentRef) {
       console.log(
-        `[StepRunner] Step ${stepRunId} already has providerRef="${stepRun.providerRef}", skipping execution`,
+        `[StepRunner] Step ${stepRunId} already has intentRef="${stepRun.intentRef}", skipping execution`,
       );
       await this.log(
         run.id,
         'info',
-        `Step "${stepRun.stepKey}" skipped — already executed (providerRef: ${stepRun.providerRef})`,
-        { stepRunId, providerRef: stepRun.providerRef },
+        `Step "${stepRun.stepKey}" skipped — already executed (intentRef: ${stepRun.intentRef})`,
+        { stepRunId, intentRef: stepRun.intentRef, providerRef: stepRun.providerRef },
       );
 
       // Ensure step is COMPLETED and advance
@@ -114,10 +114,28 @@ export class StepRunner {
       attempt: stepRun.attempt,
     };
 
-    // 6. Execute
+    // 6. Persist-before-execute: for actions, save execution intent BEFORE calling
+    //    the external service. intentRef is IMMUTABLE — never overwritten.
+    //    If worker crashes between here and completion, intentRef is already saved,
+    //    preventing re-execution on retry.
+    if (stepRun.stepType === 'action') {
+      const intentRef = `intent-${stepRunId}-attempt-${stepRun.attempt}`;
+      await this.prisma.stepRun.update({
+        where: { id: stepRunId },
+        data: { intentRef },
+      });
+      await this.log(
+        run.id,
+        'info',
+        `Action "${stepRun.stepKey}" intent persisted before execution`,
+        { stepRunId, intentRef, attempt: stepRun.attempt },
+      );
+    }
+
+    // 7. Execute
     const result = await this.dispatch(ctx);
 
-    // 7. Save result
+    // 8. Save result — providerRef is the real external reference (separate from intentRef)
     await this.prisma.stepRun.update({
       where: { id: stepRunId },
       data: {
@@ -139,7 +157,35 @@ export class StepRunner {
       },
     );
 
-    // 8. End step → finalize run
+    // 8b. AI-specific observability: log LLM metadata separately
+    if (stepRun.stepType === 'ai_task') {
+      const aiOutput = result.output as Record<string, unknown>;
+      const meta = aiOutput.meta as Record<string, unknown> | undefined;
+      const aiGenerated = aiOutput.aiGenerated as boolean;
+      const fallbackUsed = aiOutput.fallbackUsed as boolean;
+
+      if (aiGenerated && meta) {
+        await this.log(run.id, 'info', `AI Task "${stepRun.stepKey}" — LLM call succeeded`, {
+          stepRunId,
+          model: meta.model,
+          promptVersion: meta.promptVersion,
+          promptTokens: meta.promptTokens,
+          completionTokens: meta.completionTokens,
+          totalTokens: meta.totalTokens,
+          latencyMs: meta.latencyMs,
+          finishReason: meta.finishReason,
+        });
+      } else if (fallbackUsed) {
+        await this.log(run.id, 'warn', `AI Task "${stepRun.stepKey}" — fallback activated`, {
+          stepRunId,
+          fallback: aiOutput.fallback,
+          reason: (meta as any)?.reason || 'unknown',
+          promptVersion: (meta as any)?.promptVersion || 'unknown',
+        });
+      }
+    }
+
+    // 9. End step → finalize run
     if (stepRun.stepType === 'end') {
       await this.prisma.run.update({
         where: { id: run.id },
@@ -152,7 +198,7 @@ export class StepRunner {
       return;
     }
 
-    // 9. Advance to next step
+    // 10. Advance to next step
     await this.advanceFlow(
       run.id,
       stepRun.stepKey,
@@ -245,6 +291,7 @@ export class StepRunner {
 
     // Dispatch with retry config based on step type
     const isAction = nextStep.type === 'action';
+    const isAiTask = nextStep.type === 'ai_task';
     await this.queue.add(
       'execute-step',
       { stepRunId: nextStepRun.id },
@@ -253,6 +300,8 @@ export class StepRunner {
         backoff: isAction
           ? { type: 'exponential' as const, delay: 1000 }
           : undefined,
+        // AI tasks use internal fallback, no BullMQ retry needed
+        ...(isAiTask ? { removeOnFail: false } : {}),
       },
     );
   }

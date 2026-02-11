@@ -14,7 +14,7 @@ export class RunsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly queueService: QueueService,
-  ) {}
+  ) { }
 
   async create(dto: CreateRunDto) {
     // Verify workflow exists and is published
@@ -132,10 +132,47 @@ export class RunsService {
 
     // Dispatch first step to worker queue
     if (result.firstStepRun) {
-      await this.queueService.dispatchStep(
-        result.firstStepRun.id,
-        result.firstStepRun.stepType,
-      );
+      try {
+        await this.queueService.dispatchStep(
+          result.firstStepRun.id,
+          result.firstStepRun.stepType,
+        );
+
+        // Mark dispatch as successful
+        await this.prisma.run.update({
+          where: { id: result.run.id },
+          data: { dispatchStatus: 'DISPATCHED' },
+        });
+      } catch (err: any) {
+        // Dispatch failed — mark run as FAILED with explicit log
+        await this.prisma.run.update({
+          where: { id: result.run.id },
+          data: {
+            status: 'FAILED',
+            dispatchStatus: 'FAILED',
+            error: `Dispatch to queue failed: ${err.message}`,
+            finishedAt: new Date(),
+          },
+        });
+
+        await this.prisma.runLog.create({
+          data: {
+            runId: result.run.id,
+            level: 'error',
+            message: `Run FAILED — dispatch to queue failed: ${err.message}`,
+            context: {
+              stepRunId: result.firstStepRun.id,
+              error: err.message,
+            } as any,
+          },
+        });
+
+        // Return the failed run instead of throwing — caller sees the failure
+        const failedRun = await this.prisma.run.findUnique({
+          where: { id: result.run.id },
+        });
+        return { run: failedRun, firstStepRun: result.firstStepRun, dispatchFailed: true };
+      }
     }
 
     return result;
@@ -182,5 +219,61 @@ export class RunsService {
         workflow: { select: { id: true, name: true, version: true } },
       },
     });
+  }
+
+  /**
+   * Watchdog: finds StepRuns stuck in RUNNING status for longer than `thresholdMinutes`.
+   * Pure observability — does not modify data, only lists + logs.
+   */
+  async findStuck(thresholdMinutes = 10, limit = 50) {
+    const threshold = new Date(Date.now() - thresholdMinutes * 60 * 1000);
+
+    const stuckSteps = await this.prisma.stepRun.findMany({
+      where: {
+        status: 'RUNNING',
+        startedAt: { lt: threshold },
+      },
+      orderBy: { startedAt: 'asc' },
+      take: limit,
+      include: {
+        run: {
+          select: { id: true, status: true, workflow: { select: { id: true, name: true } } },
+        },
+      },
+    });
+
+    // Log alert for each stuck step
+    for (const step of stuckSteps) {
+      await this.prisma.runLog.create({
+        data: {
+          runId: step.runId,
+          level: 'warn',
+          message: `Watchdog: step "${step.stepKey}" (${step.stepType}) stuck in RUNNING since ${step.startedAt?.toISOString()}`,
+          context: {
+            stepRunId: step.id,
+            stepKey: step.stepKey,
+            stepType: step.stepType,
+            attempt: step.attempt,
+            startedAt: step.startedAt?.toISOString(),
+            thresholdMinutes,
+          } as any,
+        },
+      });
+    }
+
+    return {
+      thresholdMinutes,
+      count: stuckSteps.length,
+      stuckSteps: stuckSteps.map((s) => ({
+        stepRunId: s.id,
+        runId: s.runId,
+        stepKey: s.stepKey,
+        stepType: s.stepType,
+        attempt: s.attempt,
+        startedAt: s.startedAt,
+        workflowName: s.run.workflow.name,
+        runStatus: s.run.status,
+      })),
+    };
   }
 }

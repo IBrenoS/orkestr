@@ -17,6 +17,18 @@ export class RunsController {
     return this.runsService.findFailed(parseInt(limit || '50', 10));
   }
 
+  /** Watchdog: StepRuns stuck in RUNNING beyond threshold */
+  @Get('stuck')
+  async findStuck(
+    @Query('thresholdMinutes') thresholdMinutes?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.runsService.findStuck(
+      parseInt(thresholdMinutes || '10', 10),
+      parseInt(limit || '50', 10),
+    );
+  }
+
   @Get(':id')
   async findById(@Param('id', ParseUUIDPipe) id: string) {
     return this.runsService.findById(id);

@@ -1,9 +1,9 @@
 /**
- * Orkestr — Sprint 0 + Sprint 1 Seed
+ * Orkestr — Sprint 0 + Sprint 1 + Sprint 2 Seed
  *
  * Creates:
  *  - Demo tenant "Acme Corp"
- *  - "Cobrança Slice" workflow (condition → ai_task → action → end)
+ *  - "Cobrança Slice" workflow (condition → ai_task → action → end) — with AI config
  *  - "Sprint 1 Test" workflow (condition → action → end)
  *
  * Usage: npx ts-node prisma/seed.ts
@@ -19,15 +19,43 @@ const COBRANCA_STEPS = [
     type: 'condition',
     config: {
       description: 'Verifica se o cliente é elegível para cobrança',
-      rule: 'amount > 0',
+      rule: { field: 'amount', operator: 'greater_than', value: 0 },
     },
   },
   {
     key: 'enrich_context',
     type: 'ai_task',
     config: {
-      description: 'Enriquece contexto com tom e dados do cliente (IA assistida)',
+      description: 'Gera mensagem de cobrança personalizada usando IA',
+      systemPrompt:
+        'You are a collections specialist for a financial company. ' +
+        'Generate a polite but firm collection message in Portuguese (BR). ' +
+        'Always be professional and empathetic.',
+      userPromptTemplate:
+        'Generate a collection message for a customer with an overdue invoice.\n' +
+        'Customer ID: {{customerId}}\n' +
+        'Amount due: R$ {{amount}}\n' +
+        'Invoice details: {{invoiceId}}\n' +
+        'Generate the message and classify the urgency.',
+      outputSchema: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', description: 'The collection message in Portuguese' },
+          subject: { type: 'string', description: 'Email subject line' },
+          urgency: { type: 'string', description: 'Urgency level', enum: ['low', 'medium', 'high'] },
+          tone: { type: 'string', description: 'Tone used', enum: ['friendly', 'firm', 'urgent'] },
+        },
+        required: ['message', 'subject', 'urgency', 'tone'],
+      },
+      promptVersion: 'v1',
+      timeoutMs: 15000,
       fallback: 'use_default_template',
+      fallbackData: {
+        message: 'Prezado cliente, informamos que há um valor pendente em sua conta. Por favor, entre em contato.',
+        subject: 'Aviso de cobrança',
+        urgency: 'medium',
+        tone: 'friendly',
+      },
     },
   },
   {
@@ -54,7 +82,7 @@ const SPRINT1_STEPS = [
     type: 'condition',
     config: {
       description: 'Verifica se valor é positivo para cobrança',
-      rule: 'amount > 100',
+      rule: { field: 'amount', operator: 'greater_than', value: 100 },
       onFalse: 'done',
     },
   },

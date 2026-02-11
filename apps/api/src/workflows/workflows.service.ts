@@ -115,6 +115,18 @@ export class WorkflowsService {
       );
     }
 
+    // Validate routing references: onFalse must point to an existing step key
+    const stepKeys = new Set(steps.map((s: any) => s.key));
+    for (const step of steps) {
+      const onFalse = step.config?.onFalse;
+      if (onFalse && onFalse !== '__end__' && !stepKeys.has(onFalse)) {
+        throw new BadRequestException(
+          `Step "${step.key}" has config.onFalse="${onFalse}" but no step with that key exists. ` +
+          `Valid keys: ${[...stepKeys].join(', ')}`,
+        );
+      }
+    }
+
     const updated = await this.prisma.workflow.update({
       where: { id },
       data: { publishedAt: new Date() },
